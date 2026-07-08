@@ -1,0 +1,604 @@
+-- Enable UUID extension
+create extension if not exists "uuid-ossp";
+
+-- ============================================================
+-- CAMPAIGNS
+-- ============================================================
+create table campaigns (
+  id                      uuid primary key default uuid_generate_v4(),
+  name                    text not null,
+  world_description       text,
+  current_day             integer not null default 1,
+  map_image_url           text,
+  -- Two-point calibration: store two lat/lng pairs and the real-world
+  -- travel time between them so the app can compute distances elsewhere.
+  map_cal_point_a         jsonb,  -- { lat, lng, label }
+  map_cal_point_b         jsonb,  -- { lat, lng, label }
+  map_cal_days            numeric, -- days between A and B in a straight line
+  created_at              timestamptz not null default now(),
+  updated_at              timestamptz not null default now()
+);
+
+-- ============================================================
+-- CAMPAIGN MEMBERS  (users ↔ campaigns with roles)
+-- ============================================================
+create type campaign_role as enum ('dm', 'player');
+
+create table campaign_members (
+  id          uuid primary key default uuid_generate_v4(),
+  campaign_id uuid not null references campaigns(id) on delete cascade,
+  user_id     uuid not null references auth.users(id) on delete cascade,
+  role        campaign_role not null default 'player',
+  joined_at   timestamptz not null default now(),
+  unique(campaign_id, user_id)
+);
+
+-- ============================================================
+-- CHARACTERS
+-- ============================================================
+create table characters (
+  id          uuid primary key default uuid_generate_v4(),
+  campaign_id uuid not null references campaigns(id) on delete cascade,
+  user_id     uuid not null references auth.users(id) on delete cascade,
+  name        text not null,
+  class       text,
+  race        text,
+  level       integer not null default 1,
+  hp_current  integer not null default 10,
+  hp_max      integer not null default 10,
+  gold        integer not null default 0,
+  -- Flexible stat block: supports D&D, Pathfinder, homebrew
+  stats       jsonb not null default '{
+    "str": 10, "dex": 10, "con": 10,
+    "int": 10, "wis": 10, "cha": 10
+  }'::jsonb,
+  spells      jsonb not null default '[]'::jsonb,
+  inventory   jsonb not null default '[]'::jsonb,
+  notes       text,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+-- ============================================================
+-- SESSION STATS  (tracked per character per session)
+-- ============================================================
+create table session_stats (
+  id              uuid primary key default uuid_generate_v4(),
+  character_id    uuid not null references characters(id) on delete cascade,
+  campaign_id     uuid not null references campaigns(id) on delete cascade,
+  session_number  integer not null,
+  game_day_start  integer not null,
+  kills           integer not null default 0,
+  healing_done    integer not null default 0,
+  damage_dealt    integer not null default 0,
+  -- { "kobold": 3, "bandit": 1 } etc.
+  kill_types      jsonb not null default '{}'::jsonb,
+  notes           text,
+  created_at      timestamptz not null default now()
+);
+
+-- ============================================================
+-- FACTIONS
+-- ============================================================
+create table factions (
+  id          uuid primary key default uuid_generate_v4(),
+  campaign_id uuid not null references campaigns(id) on delete cascade,
+  name        text not null,
+  description text,
+  power       integer not null default 50 check (power between 0 and 100),
+  stability   integer not null default 50 check (stability between 0 and 100),
+  color       text not null default '#888780',
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+-- ============================================================
+-- MAP PINS
+-- ============================================================
+create type pin_type as enum ('city', 'town', 'dungeon', 'landmark', 'hidden', 'party');
+
+create table map_pins (
+  id                  uuid primary key default uuid_generate_v4(),
+  campaign_id         uuid not null references campaigns(id) on delete cascade,
+  lat                 numeric not null,
+  lng                 numeric not null,
+  label               text not null,
+  pin_type            pin_type not null default 'city',
+  -- Separate notes: DM sees all, players only see player_notes on visible pins
+  dm_notes            text,
+  player_notes        text,
+  visible_to_players  boolean not null default true,
+  -- { "Merchant Guild": 2, "Knight's Order": -1 }
+  reputation          jsonb not null default '{}'::jsonb,
+  -- Economy state
+  wealth_level        integer not null default 50 check (wealth_level between 0 and 100),
+  stability           integer not null default 50 check (stability between 0 and 100),
+  trade_modifier      numeric not null default 1.0,
+  created_at          timestamptz not null default now(),
+  updated_at          timestamptz not null default now()
+);
+
+-- ============================================================
+-- JOBS
+-- ============================================================
+create type job_status as enum ('open', 'accepted', 'completed', 'auto_resolved', 'failed');
+
+create table jobs (
+  id                    uuid primary key default uuid_generate_v4(),
+  campaign_id           uuid not null references campaigns(id) on delete cascade,
+  faction_id            uuid references factions(id) on delete set null,
+  location_pin_id       uuid references map_pins(id) on delete set null,
+  title                 text not null,
+  description           text,
+  employer              text not null,
+  reward_gold           integer not null default 0,
+  deadline_day          integer not null,
+  status                job_status not null default 'open',
+  -- What happens in the world when accepted/completed vs ignored
+  consequence_completed text,
+  consequence_ignored   text,
+  -- Applied when auto-resolved or completed
+  faction_delta         jsonb not null default '{}'::jsonb, -- { faction_id: delta }
+  economy_delta         jsonb not null default '{}'::jsonb, -- { pin_id: { wealth: delta, stability: delta } }
+  created_at            timestamptz not null default now(),
+  updated_at            timestamptz not null default now()
+);
+
+-- ============================================================
+-- CONSEQUENCE LOG
+-- ============================================================
+create table consequence_log (
+  id              uuid primary key default uuid_generate_v4(),
+  campaign_id     uuid not null references campaigns(id) on delete cascade,
+  job_id          uuid references jobs(id) on delete set null,
+  game_day        integer not null,
+  description     text not null,
+  -- Snapshot of what changed: { factions: {...}, economy: {...} }
+  deltas          jsonb not null default '{}'::jsonb,
+  -- dm_only: players won't see this entry in their log
+  dm_only         boolean not null default false,
+  created_at      timestamptz not null default now()
+);
+
+-- ============================================================
+-- PLAYER NOTES  (tagged to locations / NPCs)
+-- ============================================================
+create table player_notes (
+  id          uuid primary key default uuid_generate_v4(),
+  campaign_id uuid not null references campaigns(id) on delete cascade,
+  character_id uuid references characters(id) on delete cascade,
+  -- null = party-wide note
+  user_id     uuid not null references auth.users(id) on delete cascade,
+  title       text not null,
+  content     text not null,
+  -- Tag to a map pin or NPC name
+  pin_id      uuid references map_pins(id) on delete set null,
+  npc_name    text,
+  session_day integer,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+-- ============================================================
+-- DIRECT MESSAGES  (DM → player secret info)
+-- ============================================================
+create table messages (
+  id          uuid primary key default uuid_generate_v4(),
+  campaign_id uuid not null references campaigns(id) on delete cascade,
+  sender_id   uuid not null references auth.users(id) on delete cascade,
+  recipient_id uuid not null references auth.users(id) on delete cascade,
+  content     text not null,
+  read        boolean not null default false,
+  created_at  timestamptz not null default now()
+);
+
+-- ============================================================
+-- UPDATED_AT TRIGGER
+-- ============================================================
+create or replace function handle_updated_at()
+returns trigger as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$ language plpgsql;
+
+create trigger campaigns_updated_at    before update on campaigns    for each row execute procedure handle_updated_at();
+create trigger characters_updated_at   before update on characters   for each row execute procedure handle_updated_at();
+create trigger factions_updated_at     before update on factions     for each row execute procedure handle_updated_at();
+create trigger map_pins_updated_at     before update on map_pins     for each row execute procedure handle_updated_at();
+create trigger jobs_updated_at         before update on jobs         for each row execute procedure handle_updated_at();
+create trigger player_notes_updated_at before update on player_notes for each row execute procedure handle_updated_at();
+
+-- ============================================================
+-- ROW LEVEL SECURITY
+-- Every table is locked down so users can only see data for
+-- campaigns they are members of, and DM-only data requires
+-- the dm role.
+-- ============================================================
+
+alter table campaigns        enable row level security;
+alter table campaign_members enable row level security;
+alter table characters       enable row level security;
+alter table session_stats    enable row level security;
+alter table factions         enable row level security;
+alter table map_pins         enable row level security;
+alter table jobs             enable row level security;
+alter table consequence_log  enable row level security;
+alter table player_notes     enable row level security;
+alter table messages         enable row level security;
+
+-- Helper: is the current user a member of a campaign?
+create or replace function is_member(cid uuid)
+returns boolean as $$
+  select exists (
+    select 1 from campaign_members
+    where campaign_id = cid and user_id = auth.uid()
+  );
+$$ language sql security definer stable;
+
+-- Helper: is the current user the DM of a campaign?
+create or replace function is_dm(cid uuid)
+returns boolean as $$
+  select exists (
+    select 1 from campaign_members
+    where campaign_id = cid and user_id = auth.uid() and role = 'dm'
+  );
+$$ language sql security definer stable;
+
+-- ── CAMPAIGNS ───────────────────────────────────────────────
+create policy "members can view their campaigns"
+  on campaigns for select
+  using (is_member(id));
+
+create policy "dm can update campaign"
+  on campaigns for update
+  using (is_dm(id));
+
+create policy "authenticated users can create campaigns"
+  on campaigns for insert
+  with check (auth.uid() is not null);
+
+-- ── CAMPAIGN MEMBERS ────────────────────────────────────────
+create policy "members can view membership"
+  on campaign_members for select
+  using (is_member(campaign_id));
+
+create policy "dm can manage members"
+  on campaign_members for all
+  using (is_dm(campaign_id));
+
+create policy "users can join campaigns"
+  on campaign_members for insert
+  with check (user_id = auth.uid());
+
+-- ── CHARACTERS ──────────────────────────────────────────────
+create policy "members can view characters"
+  on characters for select
+  using (is_member(campaign_id));
+
+create policy "player owns their character"
+  on characters for insert
+  with check (is_member(campaign_id) and user_id = auth.uid());
+
+create policy "player or dm can update character"
+  on characters for update
+  using (user_id = auth.uid() or is_dm(campaign_id));
+
+-- ── SESSION STATS ────────────────────────────────────────────
+create policy "members can view session stats"
+  on session_stats for select
+  using (is_member(campaign_id));
+
+create policy "dm can write session stats"
+  on session_stats for insert
+  with check (is_dm(campaign_id));
+
+-- ── FACTIONS ────────────────────────────────────────────────
+create policy "members can view factions"
+  on factions for select
+  using (is_member(campaign_id));
+
+create policy "dm can manage factions"
+  on factions for all
+  using (is_dm(campaign_id));
+
+-- ── MAP PINS ────────────────────────────────────────────────
+-- Players see visible pins only; DM sees everything
+create policy "players see visible pins"
+  on map_pins for select
+  using (
+    is_dm(campaign_id)
+    or (is_member(campaign_id) and visible_to_players = true)
+  );
+
+create policy "dm can manage map pins"
+  on map_pins for all
+  using (is_dm(campaign_id));
+
+-- ── JOBS ────────────────────────────────────────────────────
+create policy "members can view open jobs"
+  on jobs for select
+  using (is_member(campaign_id));
+
+create policy "dm can manage jobs"
+  on jobs for all
+  using (is_dm(campaign_id));
+
+-- ── CONSEQUENCE LOG ─────────────────────────────────────────
+create policy "players see non-dm-only log entries"
+  on consequence_log for select
+  using (
+    is_dm(campaign_id)
+    or (is_member(campaign_id) and dm_only = false)
+  );
+
+create policy "dm can write consequence log"
+  on consequence_log for insert
+  with check (is_dm(campaign_id));
+
+-- ── PLAYER NOTES ────────────────────────────────────────────
+create policy "users see their own notes or party notes"
+  on player_notes for select
+  using (
+    is_member(campaign_id)
+    and (user_id = auth.uid() or character_id is null)
+  );
+
+create policy "members can create notes"
+  on player_notes for insert
+  with check (is_member(campaign_id) and user_id = auth.uid());
+
+create policy "users can update their own notes"
+  on player_notes for update
+  using (user_id = auth.uid());
+
+-- ── MESSAGES ────────────────────────────────────────────────
+create policy "users see messages they sent or received"
+  on messages for select
+  using (sender_id = auth.uid() or recipient_id = auth.uid());
+
+create policy "members can send messages"
+  on messages for insert
+  with check (is_member(campaign_id) and sender_id = auth.uid());
+
+create policy "recipient can mark read"
+  on messages for update
+  using (recipient_id = auth.uid());
+
+-- ============================================================
+-- ADVANCE DAY  (the world consequence engine)
+-- Called by the DM. Increments the campaign day, auto-resolves
+-- expired jobs, applies their economy/faction deltas, and
+-- writes consequence log entries.
+-- ============================================================
+
+create or replace function advance_day(p_campaign_id uuid)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_new_day       integer;
+  v_job           record;
+  v_log_entries   jsonb[] := '{}';
+  v_summary       jsonb;
+  v_faction_id    text;
+  v_pin_id        text;
+  v_delta         jsonb;
+  v_faction_delta integer;
+  v_wealth_delta  integer;
+  v_stab_delta    integer;
+begin
+  -- Only the DM can advance the day
+  if not is_dm(p_campaign_id) then
+    raise exception 'Only the DM can advance the day';
+  end if;
+
+  -- Increment day
+  update campaigns
+  set current_day = current_day + 1
+  where id = p_campaign_id
+  returning current_day into v_new_day;
+
+  -- Find all open jobs that have now expired
+  for v_job in
+    select * from jobs
+    where campaign_id = p_campaign_id
+      and status = 'open'
+      and deadline_day < v_new_day
+  loop
+    -- Mark as auto-resolved
+    update jobs set status = 'auto_resolved' where id = v_job.id;
+
+    -- Apply faction deltas from consequence_ignored
+    if v_job.faction_delta is not null and v_job.faction_delta != '{}'::jsonb then
+      for v_faction_id, v_delta in select * from jsonb_each(v_job.faction_delta)
+      loop
+        v_faction_delta := (v_delta#>>'{ignored}')::integer;
+        if v_faction_delta is not null then
+          update factions
+          set power = greatest(0, least(100, power + v_faction_delta))
+          where id = v_faction_id::uuid and campaign_id = p_campaign_id;
+        end if;
+      end loop;
+    end if;
+
+    -- Apply economy deltas
+    if v_job.economy_delta is not null and v_job.economy_delta != '{}'::jsonb then
+      for v_pin_id, v_delta in select * from jsonb_each(v_job.economy_delta)
+      loop
+        v_wealth_delta := (v_delta->>'wealth')::integer;
+        v_stab_delta   := (v_delta->>'stability')::integer;
+        update map_pins
+        set
+          wealth_level  = greatest(0, least(100, wealth_level  + coalesce(v_wealth_delta, 0))),
+          stability     = greatest(0, least(100, stability      + coalesce(v_stab_delta,  0))),
+          trade_modifier = case
+            when stability < 25 then 1.3
+            when stability < 50 then 1.15
+            when stability > 75 then 0.9
+            else 1.0
+          end
+        where id = v_pin_id::uuid and campaign_id = p_campaign_id;
+      end loop;
+    end if;
+
+    -- Write consequence log entry
+    insert into consequence_log (campaign_id, job_id, game_day, description, deltas, dm_only)
+    values (
+      p_campaign_id,
+      v_job.id,
+      v_new_day,
+      coalesce(v_job.consequence_ignored, '"' || v_job.title || '" expired with no action taken.'),
+      jsonb_build_object(
+        'factions', v_job.faction_delta,
+        'economy',  v_job.economy_delta
+      ),
+      false
+    );
+
+    v_log_entries := v_log_entries || jsonb_build_object(
+      'job_id', v_job.id,
+      'title',  v_job.title,
+      'consequence', v_job.consequence_ignored
+    );
+  end loop;
+
+  v_summary := jsonb_build_object(
+    'new_day',        v_new_day,
+    'jobs_resolved',  array_length(v_log_entries, 1),
+    'log_entries',    to_jsonb(v_log_entries)
+  );
+
+  return v_summary;
+end;
+$$;
+
+-- ============================================================
+-- RESOLVE JOB  (players complete a job)
+-- ============================================================
+create or replace function resolve_job(p_job_id uuid, p_completed boolean default true)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_job         record;
+  v_new_status  job_status;
+  v_faction_id  text;
+  v_delta       jsonb;
+  v_pin_id      text;
+begin
+  select * into v_job from jobs where id = p_job_id;
+  if not found then raise exception 'Job not found'; end if;
+  if not is_dm(v_job.campaign_id) then raise exception 'Only DM can resolve jobs'; end if;
+
+  v_new_status := case when p_completed then 'completed'::job_status else 'failed'::job_status end;
+  update jobs set status = v_new_status where id = p_job_id;
+
+  -- Apply completed deltas if successful
+  if p_completed and v_job.faction_delta != '{}'::jsonb then
+    for v_faction_id, v_delta in select * from jsonb_each(v_job.faction_delta)
+    loop
+      update factions
+      set power = greatest(0, least(100, power + ((v_delta->>'completed')::integer)))
+      where id = v_faction_id::uuid;
+    end loop;
+  end if;
+
+  if p_completed and v_job.economy_delta != '{}'::jsonb then
+    for v_pin_id, v_delta in select * from jsonb_each(v_job.economy_delta)
+    loop
+      update map_pins
+      set
+        wealth_level  = greatest(0, least(100, wealth_level + coalesce((v_delta->>'wealth_completed')::integer, 0))),
+        stability     = greatest(0, least(100, stability     + coalesce((v_delta->>'stability_completed')::integer, 0)))
+      where id = v_pin_id::uuid;
+    end loop;
+  end if;
+
+  insert into consequence_log (campaign_id, job_id, game_day, description, deltas)
+  select
+    v_job.campaign_id, p_job_id,
+    current_day,
+    case when p_completed
+      then coalesce(v_job.consequence_completed, '"' || v_job.title || '" completed by the party.')
+      else '"' || v_job.title || '" failed.'
+    end,
+    v_job.faction_delta
+  from campaigns where id = v_job.campaign_id;
+
+  return jsonb_build_object('status', v_new_status, 'job_id', p_job_id);
+end;
+$$;
+
+-- ============================================================
+-- TRAVEL TIME ESTIMATE  (survival roll mechanic)
+-- Given two lat/lng points, a roll result (1-20), and the
+-- campaign's calibration data, returns estimated travel days
+-- with optional fuzz for low rolls.
+-- ============================================================
+create or replace function estimate_travel(
+  p_campaign_id uuid,
+  p_from_lat    numeric,
+  p_from_lng    numeric,
+  p_to_lat      numeric,
+  p_to_lng      numeric,
+  p_roll        integer default 20  -- d20 result; 20 = perfect info
+)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_campaign      record;
+  v_dist_ab       numeric;  -- calibration distance (lat/lng units)
+  v_dist_query    numeric;  -- query distance (lat/lng units)
+  v_true_days     numeric;
+  v_fuzz_pct      numeric;
+  v_low_days      numeric;
+  v_high_days     numeric;
+begin
+  select * into v_campaign from campaigns where id = p_campaign_id;
+  if not is_member(p_campaign_id) then raise exception 'Not a member'; end if;
+  if v_campaign.map_cal_days is null then
+    raise exception 'Map not calibrated — DM must set two reference points first';
+  end if;
+
+  -- Euclidean distance in lat/lng space (good enough for custom map images)
+  v_dist_ab := sqrt(
+    power((v_campaign.map_cal_point_b->>'lat')::numeric - (v_campaign.map_cal_point_a->>'lat')::numeric, 2) +
+    power((v_campaign.map_cal_point_b->>'lng')::numeric - (v_campaign.map_cal_point_a->>'lng')::numeric, 2)
+  );
+  v_dist_query := sqrt(
+    power(p_to_lat - p_from_lat, 2) +
+    power(p_to_lng - p_from_lng, 2)
+  );
+
+  v_true_days := (v_dist_query / v_dist_ab) * v_campaign.map_cal_days;
+
+  -- Fuzz based on roll: roll 20 = exact, roll 1 = up to ±50% error
+  v_fuzz_pct := case
+    when p_roll >= 20 then 0
+    when p_roll >= 15 then 0.05
+    when p_roll >= 10 then 0.15
+    when p_roll >= 5  then 0.30
+    else                   0.50
+  end;
+
+  v_low_days  := round(v_true_days * (1 - v_fuzz_pct));
+  v_high_days := round(v_true_days * (1 + v_fuzz_pct));
+
+  return jsonb_build_object(
+    'true_days',  round(v_true_days, 1),
+    'roll',       p_roll,
+    'fuzz_pct',   v_fuzz_pct,
+    'estimate',   case
+      when v_fuzz_pct = 0 then to_jsonb(round(v_true_days, 1))
+      else jsonb_build_object('min', v_low_days, 'max', v_high_days)
+    end,
+    'revealed',   v_fuzz_pct = 0
+  );
+end;
+$$;
